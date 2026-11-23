@@ -1,3 +1,4 @@
+{-# language GADTs #-}
 {-# language BangPatterns #-}
 {-# language DeriveFunctor #-}
 {-# language ScopedTypeVariables #-}
@@ -59,73 +60,92 @@ partitionSeq pivot input =
 incSort :: Ord a => StdGen -> Seq a -> Seq a
 incSort !_g (Seq EmptyT) = S.empty
 incSort !_g s@(Seq (Single _)) = s
-incSort g s = Seq $ doSort (length s) 1 unpackSingleton g (Single (Chunk Unsorted s))
-  where
-    unpackSingleton _g (Single (Chunk _ (Seq (Single x)))) = x
-    unpackSingleton _ _ = error "Parted is not a singleton at the leaf"
+incSort g s = Seq $ doSort (length s) Leaf g (Single (Chunk Unsorted s))
 
-doSort :: forall a b. Ord a => Int -> Int -> (StdGen -> Parted a -> b) -> StdGen -> Parted a -> FingerTree b
--- This is awful. It would be nicer to use some sort of appropriate functor, I imagine.
-doSort n !mSize m = case n of
+data Depth a b where
+  Leaf :: Depth a (Elem a)
+  Branch :: !Int -> !(Depth a b) -> Depth a (Node b)
+
+-- Unpack the generators once the split is demanded. Keep the bindings
+-- of these records lazy so constructing the output shape does no sorting.
+data ThreeParts a = ThreeParts
+  {-# UNPACK #-} !StdGen {-# UNPACK #-} !StdGen {-# UNPACK #-} !StdGen
+  (Parted a) (Parted a) (Parted a)
+
+data TwoParts a = TwoParts {-# UNPACK #-} !StdGen {-# UNPACK #-} !StdGen
+  (Parted a) (Parted a)
+
+depthSize :: Depth a b -> Int
+depthSize Leaf = 1
+depthSize (Branch childSize _) = 3 * childSize
+
+buildItem :: Ord a => Depth a b -> StdGen -> Parted a -> b
+buildItem Leaf _ (Single (Chunk _ (Seq (Single x)))) = x
+buildItem Leaf _ _ = error "Parted is not a singleton at the leaf"
+buildItem (Branch childSize child) g p =
+  Node3 (3 * childSize) (buildItem child g1 left) (buildItem child g2 mid) (buildItem child g3 right)
+  where
+    ThreeParts g1 g2 g3 left mid right =
+      case divideParted g childSize p of { TripleS left rest g' ->
+      case divideParted g' childSize rest of { TripleS mid right g'' ->
+      case splitGen g'' of { (g1, g''') ->
+      case splitGen g''' of { (g2, g3) ->
+         ThreeParts g1 g2 g3 left mid right }}}}
+
+doSort :: forall a b. Ord a => Int -> Depth a b -> StdGen -> Parted a -> FingerTree b
+doSort n depth = case n of
     0 -> emptyTree
-    1 -> \g p -> Single (m g p)
+    1 -> \g p -> Single (buildItem depth g p)
     2 -> deepA 1 one emptyTree 1 one
     3 -> deepA 2 two emptyTree 1 one
     4 -> deepA 2 two emptyTree 2 two
     5 -> deepA 3 three emptyTree 2 two
     6 -> deepA 3 three emptyTree 3 three
     _ -> case n `quotRem` 3 of
-           (q,0) -> deepA 3 three (doSort (q - 2) mSize' n3) 3 three
-           (q,1) -> deepA 2 two (doSort (q - 1) mSize' n3) 2 two
-           (q,_) -> deepA 3 three (doSort (q - 1) mSize' n3) 2 two
-      where !mSize' = 3 * mSize
-            n3 g p = Node3 mSize' (m g1 left) (m g2 mid) (m g3 right)
-              where
-                (g1, g2, g3, left, mid, right) =
-                  case divideParted g mSize p of { TripleS left rest g' ->
-                  case divideParted g' mSize rest of { TripleS mid right g'' ->
-                  case splitGen g'' of { (g1, g''') ->
-                  case splitGen g''' of { (g2, g3) ->
-                     (g1, g2, g3, left, mid, right) }}}}
+           (q,0) -> deepA 3 three (doSort (q - 2) (Branch mSize depth)) 3 three
+           (q,1) -> deepA 2 two (doSort (q - 1) (Branch mSize depth)) 2 two
+           (q,_) -> deepA 3 three (doSort (q - 1) (Branch mSize depth)) 2 two
   where
+    !mSize = depthSize depth
+
     deepA :: Int -> (StdGen -> Parted a -> Digit b) -> (StdGen -> Parted a -> FingerTree (Node b)) -> Int -> (StdGen -> Parted a -> Digit b) -> StdGen -> Parted a -> FingerTree b
     deepA prl prg mg sfl sfg g p =
-      let (g1, g2, g3, left, mid, right) = deepSplitty prl sfl g p
+      let ThreeParts g1 g2 g3 left mid right = deepSplitty prl sfl g p
       in Deep (n * mSize) (prg g1 left) (mg g2 mid) (sfg g3 right)
 
     -- If we inline this into deepA (which would be a much more natural way to
     -- write it), then deepA doesn't inline, which is mildly unfortunate.
     {-# NOINLINE deepSplitty #-}
-    deepSplitty :: Int -> Int -> StdGen -> Parted a -> (StdGen, StdGen, StdGen, Parted a, Parted a, Parted a)
+    deepSplitty :: Int -> Int -> StdGen -> Parted a -> ThreeParts a
     deepSplitty prl sfl g p =
       case divideParted g (prl * mSize) p of { TripleS left rest g' ->
       case divideParted g' (mSize * (n - prl - sfl)) rest of { TripleS mid right g'' ->
       case splitGen g'' of { (g1, g''') ->
-      case splitGen g''' of { (g2, g3) -> (g1, g2, g3, left, mid, right)
+      case splitGen g''' of { (g2, g3) -> ThreeParts g1 g2 g3 left mid right
       }}}}
 
     one :: StdGen -> Parted a -> Digit b
-    one g p = One (m g p)
+    one g p = One (buildItem depth g p)
 
     -- Apply the child builders outside the lazy split binding. This lets lookup
     -- read a child's cached size without forcing its input partition.
     two :: StdGen -> Parted a -> Digit b
-    two g p = Two (m g1 p1) (m g2 p2)
+    two g p = Two (buildItem depth g1 p1) (buildItem depth g2 p2)
       where
-        (g1, g2, p1, p2) =
+        TwoParts g1 g2 p1 p2 =
           case divideParted g mSize p of { (TripleS p1 p2 g') ->
           case splitGen g' of { (g1, g2) ->
-            (g1, g2, p1, p2) }}
+            TwoParts g1 g2 p1 p2 }}
 
     three :: StdGen -> Parted a -> Digit b
-    three g p = Three (m g1 p1) (m g2 p2) (m g3 p3)
+    three g p = Three (buildItem depth g1 p1) (buildItem depth g2 p2) (buildItem depth g3 p3)
       where
-        (g1, g2, g3, p1, p2, p3) =
+        ThreeParts g1 g2 g3 p1 p2 p3 =
           case divideParted g mSize p of { TripleS p1 p' g' ->
           case divideParted g' mSize p' of { TripleS p2 p3 g'' ->
           case splitGen g'' of { (g1, g''') ->
           case splitGen g''' of { (g2, g3) ->
-            (g1, g2, g3, p1, p2, p3) }}}}
+            ThreeParts g1 g2 g3 p1 p2 p3 }}}}
 
     emptyTree _g _p = EmptyT
 
